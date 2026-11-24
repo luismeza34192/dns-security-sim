@@ -224,3 +224,6 @@ __marimo__/
 
 keys/
 trust_anchor.txt
+
+# macOS system files
+.DS_Store
