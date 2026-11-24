@@ -1,5 +1,4 @@
 # DNS security client
-# DNS security client
 
 import json
 import secrets

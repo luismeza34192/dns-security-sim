@@ -1,5 +1,4 @@
 # DNS security server
-# DNS security server
 
 import json
 import logging
