@@ -1,5 +1,7 @@
 # DNS security server
 
+import argparse
+import base64
 import json
 import logging
 import socket
@@ -9,6 +11,7 @@ from pathlib import Path
 
 from dnssec_crypto import (
     canonical_record,
+    generate_key_pair,
     generate_or_load_keys,
     public_key_fingerprint,
     public_key_to_base64,
@@ -20,6 +23,35 @@ HOST = "127.0.0.1"
 PORT = 53535
 RECORDS_FILE = Path("records.json")
 TTL_SECONDS = 300
+
+# Fields covered by the digital signature, in standard order
+SIGNED_FIELDS = [
+    "name",
+    "record_type",
+    "address",
+    "ttl",
+    "key_id",
+    "inception",
+    "expiration",
+    "transaction_id",
+    "nonce",
+]
+
+# Fields used only for routing or processing, not signed
+UNSIGNED_FIELDS = ["type", "status", "public_key", "signature"]
+
+# Attack modes for the security demonstrations
+# Each one simulates an attacker sitting between the server and the client
+ATTACK_MODES = {
+    "tamper": "Change the IP address after the response is signed",
+    "badsig": "Corrupt one byte of the signature",
+    "wrongkey": "Re-sign a fake address with an attacker key and send that key",
+    "keyspoof": "Send the attacker key but keep the trusted key ID",
+    "expired": "Send a correctly signed response whose validity period has ended",
+    "replay": "Capture the first response, then resend it to later queries",
+}
+
+FAKE_ADDRESS = "10.0.0.66"
 
 
 logging.basicConfig(
@@ -128,7 +160,114 @@ def create_signed_response(query, records, private_key, public_key, key_id):
     }
 
 
-def handle_client(connection, client_address, records, private_key, public_key):
+# Attack simulation, used only when the server starts with --attack
+
+def resign_response(response, private_key):
+    """Recompute the signature over a response's current fields."""
+    signed_data = canonical_record(
+        **{field: response[field] for field in SIGNED_FIELDS}
+    )
+    response["signature"] = sign_record(private_key, signed_data)
+    return response
+
+
+def apply_attack(response, private_key, attack_state):
+    """
+    Modify a valid signed response the way an attacker would.
+    Error responses and normal mode are passed through unchanged.
+    """
+    mode = attack_state["mode"]
+
+    if mode is None or response.get("status") != "SUCCESS":
+        return response
+
+    response = dict(response)
+
+    if mode == "tamper":
+        logging.warning(
+            "ATTACK tamper: changing address %s -> %s after signing",
+            response["address"],
+            FAKE_ADDRESS,
+        )
+        response["address"] = FAKE_ADDRESS
+
+    elif mode == "badsig":
+        raw = bytearray(base64.b64decode(response["signature"]))
+        raw[0] ^= 0x01
+        response["signature"] = base64.b64encode(bytes(raw)).decode("ascii")
+        logging.warning("ATTACK badsig: flipped one bit of the signature")
+
+    elif mode == "wrongkey":
+        attacker_private, attacker_public = attack_state["attacker_keys"]
+        response["address"] = FAKE_ADDRESS
+        response["key_id"] = public_key_fingerprint(attacker_public)
+        response["public_key"] = public_key_to_base64(attacker_public)
+        resign_response(response, attacker_private)
+        logging.warning(
+            "ATTACK wrongkey: fake address %s signed with attacker key %s",
+            FAKE_ADDRESS,
+            response["key_id"][:16] + "...",
+        )
+
+    elif mode == "keyspoof":
+        attacker_private, attacker_public = attack_state["attacker_keys"]
+        response["address"] = FAKE_ADDRESS
+        response["public_key"] = public_key_to_base64(attacker_public)
+        resign_response(response, attacker_private)
+        logging.warning(
+            "ATTACK keyspoof: attacker key sent under the trusted key ID"
+        )
+
+    elif mode == "expired":
+        now = datetime.now(timezone.utc)
+        response["inception"] = (now - timedelta(hours=2)).isoformat()
+        response["expiration"] = (now - timedelta(hours=1)).isoformat()
+        resign_response(response, private_key)
+        logging.warning(
+            "ATTACK expired: validly signed, but expired at %s",
+            response["expiration"],
+        )
+
+    elif mode == "replay":
+        cache_key = (response["name"], response["record_type"])
+
+        with attack_state["lock"]:
+            captured = attack_state["replay_cache"].get(cache_key)
+
+            if captured is None:
+                attack_state["replay_cache"][cache_key] = dict(response)
+                logging.warning(
+                    "ATTACK replay: captured response for %s, "
+                    "forwarding it normally this time",
+                    response["name"],
+                )
+                return response
+
+        # The attacker copies the new query's ID and nonce into the old response so it passes the ID check
+        # The signature still covers the original ID and nonce, so verification fails.
+        replayed = dict(captured)
+        replayed["transaction_id"] = response["transaction_id"]
+        replayed["nonce"] = response["nonce"]
+        logging.warning(
+            "ATTACK replay: resending captured response for %s "
+            "with the new transaction ID and nonce",
+            response["name"],
+        )
+        return replayed
+
+    return response
+
+
+# Networking
+
+def handle_client(
+    connection,
+    client_address,
+    records,
+    private_key,
+    public_key,
+    attack_state,
+):
     """Receive queries from one client and send responses."""
     logging.info("Client connected: %s", client_address)
 
@@ -149,8 +288,10 @@ def handle_client(connection, client_address, records, private_key, public_key):
                 try:
                     query = json.loads(line)
                     logging.info(
-                        "Received query for %s",
+                        "Received query: id=%s name=%s type=%s",
+                        query.get("transaction_id"),
                         query.get("name"),
+                        query.get("record_type"),
                     )
 
                     response = create_signed_response(
@@ -161,6 +302,12 @@ def handle_client(connection, client_address, records, private_key, public_key):
                         key_id,
                     )
 
+                    response = apply_attack(
+                        response,
+                        private_key,
+                        attack_state,
+                    )
+
                 except json.JSONDecodeError:
                     response = {
                         "type": "DNS_RESPONSE",
@@ -168,10 +315,18 @@ def handle_client(connection, client_address, records, private_key, public_key):
                         "error": "Invalid JSON request",
                     }
 
-                logging.info(
-                    "Sending %s response",
-                    response.get("status"),
-                )
+                if response.get("status") == "SUCCESS":
+                    logging.info(
+                        "Sending SUCCESS response: %s -> %s (signature %s...)",
+                        response.get("name"),
+                        response.get("address"),
+                        response.get("signature", "")[:16],
+                    )
+                else:
+                    logging.info(
+                        "Sending ERROR response: %s",
+                        response.get("error"),
+                    )
 
                 output_stream.write(json.dumps(response) + "\n")
                 output_stream.flush()
@@ -183,14 +338,34 @@ def handle_client(connection, client_address, records, private_key, public_key):
         logging.info("Client disconnected: %s", client_address)
 
 
-def start_server():
+def start_server(attack=None):
     """Start the DNS security server."""
     records = load_records()
     private_key, public_key = generate_or_load_keys()
     key_id = public_key_fingerprint(public_key)
 
+    attack_state = {
+        "mode": attack,
+        "attacker_keys": None,
+        "replay_cache": {},
+        "lock": threading.Lock(),
+    }
+
+    if attack in ("wrongkey", "keyspoof"):
+        attack_state["attacker_keys"] = generate_key_pair()
+
     logging.info("Loaded %d DNS record names", len(records))
     logging.info("Trusted key identifier: %s", key_id)
+    logging.info("Signed fields: %s", ", ".join(SIGNED_FIELDS))
+    logging.info("Unsigned fields: %s", ", ".join(UNSIGNED_FIELDS))
+
+    if attack:
+        logging.warning(
+            "ATTACK MODE '%s': %s",
+            attack,
+            ATTACK_MODES[attack],
+        )
+
     logging.info("Listening on %s:%s", HOST, PORT)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
@@ -213,11 +388,28 @@ def start_server():
                     records,
                     private_key,
                     public_key,
+                    attack_state,
                 ),
                 daemon=True,
             )
             client_thread.start()
 
 
+def parse_arguments():
+    """Read command-line options."""
+    parser = argparse.ArgumentParser(description="DNS security server")
+    parser.add_argument(
+        "--attack",
+        choices=sorted(ATTACK_MODES),
+        help="Simulate an attacker modifying responses (for demos)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    start_server()
+    arguments = parse_arguments()
+
+    try:
+        start_server(arguments.attack)
+    except KeyboardInterrupt:
+        logging.info("Server stopped")
