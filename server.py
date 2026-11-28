@@ -377,8 +377,16 @@ def start_server(attack=None):
         server_socket.bind((HOST, PORT))
         server_socket.listen()
 
+        # Wake up once a second so Ctrl+C works on Windows.
+        server_socket.settimeout(1.0)
+
         while True:
-            connection, client_address = server_socket.accept()
+            try:
+                connection, client_address = server_socket.accept()
+            except socket.timeout:
+                continue
+
+            connection.settimeout(None)
 
             client_thread = threading.Thread(
                 target=handle_client,
