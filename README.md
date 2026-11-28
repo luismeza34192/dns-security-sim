@@ -8,7 +8,7 @@ CSC 154, Computer System Attacks and Countermeasures, Fall 2026.
 
 | File | Purpose |
 | --- | --- |
-| `server.py` | Authoritative DNS server. Loads records, signs responses, logs queries. |
+| `server.py` | Authoritative DNS server. Loads records, signs responses, logs queries. Has an attack mode for security tests. |
 | `client.py` | DNS client. Sends queries and validates every response before trusting it. |
 | `dnssec_crypto.py` | Shared crypto module: keys, fingerprints, canonical format, signing, verifying. |
 | `test_crypto.py` | Local tests of the crypto module, run without any networking. |
@@ -83,6 +83,33 @@ Example of a rejected response:
 ```
 REJECTED: Unknown domain name: nope.example.com
 ```
+
+## Security tests
+
+The server has an attack mode that simulates an attacker between the server and the client. The attacker takes each valid signed response and changes it before it reaches the client. In every case the client should print `REJECTED` and never show the fake address.
+
+Start the server in an attack mode:
+
+```
+python server.py --attack MODE
+```
+
+Then run `python client.py` in the second terminal and query `www.example.com`. Stop the server with Ctrl+C before switching modes. Run `python server.py --help` to list the modes.
+
+| Mode | What the attacker does | Check that catches it | Client output |
+| --- | --- | --- | --- |
+| `tamper` | Changes the address to `10.0.0.66` after the response is signed | Signature | `REJECTED: Digital signature verification failed.` |
+| `badsig` | Flips one bit of the signature | Signature | `REJECTED: Digital signature verification failed.` |
+| `wrongkey` | Signs a fake address with its own key and sends that key and key ID | Key ID vs. trust anchor | `REJECTED: The response key does not match the trust anchor.` |
+| `keyspoof` | Sends its own key and signature but keeps the trusted key ID | Public-key fingerprint vs. trust anchor | `REJECTED: The public-key fingerprint is not trusted.` |
+| `expired` | Sends a correctly signed response whose validity period ended an hour ago | Validity period | `REJECTED: The DNS response is expired or not yet valid.` |
+| `replay` | Captures a valid response, then resends it to a later query with the new transaction ID and nonce copied in | Signature (the ID and nonce are signed) | `REJECTED: Digital signature verification failed.` |
+
+**Running the replay test.** Run the client twice for the same name. The first query is captured and forwarded normally, so it prints `ACCEPTED`. The second query gets the captured response and prints `REJECTED`. A naive replay that keeps the old transaction ID fails even earlier, with `REJECTED: Transaction ID does not match.`
+
+**What the attacks show.** The `wrongkey` and `keyspoof` attacks produce signatures that are mathematically valid for the attacker's key. They fail only because the client checks the key against its trust anchor, which is why a signature alone is not enough without a trusted key. The `expired` response is signed with the real server key, so it fails only on the validity period, which shows how stale data is caught.
+
+While an attack mode is running, the server log prints an `ATTACK` line for each response it modifies.
 
 ## Message protocol
 
